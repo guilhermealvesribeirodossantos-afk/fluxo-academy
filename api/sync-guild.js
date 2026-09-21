@@ -68,6 +68,64 @@ async function supabaseRequest(path, options = {}) {
   return data;
 }
 
+
+async function verificarAdministrador(req) {
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const supabaseSecretKey = process.env.SUPABASE_SECRET_KEY;
+  const adminUserId = process.env.ADMIN_USER_ID;
+
+  if (!supabaseUrl || !supabaseSecretKey || !adminUserId) {
+    const erro = new Error("Configuração administrativa incompleta na Vercel.");
+    erro.status = 500;
+    throw erro;
+  }
+
+  const authorization = req.headers.authorization || "";
+  const accessToken = authorization.startsWith("Bearer ")
+    ? authorization.slice(7).trim()
+    : "";
+
+  if (!accessToken) {
+    const erro = new Error("Sessão administrativa ausente.");
+    erro.status = 401;
+    throw erro;
+  }
+
+  const resposta = await fetch(`${supabaseUrl}/auth/v1/user`, {
+    method: "GET",
+    headers: {
+      apikey: supabaseSecretKey,
+      Authorization: `Bearer ${accessToken}`,
+      Accept: "application/json",
+    },
+  });
+
+  const texto = await resposta.text();
+  let usuario = null;
+
+  if (texto) {
+    try {
+      usuario = JSON.parse(texto);
+    } catch {
+      usuario = texto;
+    }
+  }
+
+  if (!resposta.ok || !usuario?.id) {
+    const erro = new Error("Sessão inválida ou expirada.");
+    erro.status = 401;
+    throw erro;
+  }
+
+  if (usuario.id !== adminUserId) {
+    const erro = new Error("Usuário sem permissão de administrador.");
+    erro.status = 403;
+    throw erro;
+  }
+
+  return usuario;
+}
+
 export default async function handler(req, res) {
   // A sincronização altera dados e consome o cooldown do TitansDB.
   // Por isso, não permitimos mais chamadas GET pelo navegador.
@@ -80,23 +138,14 @@ export default async function handler(req, res) {
     });
   }
 
-  const syncSecret = process.env.SYNC_SECRET;
-  const authorization = req.headers.authorization || "";
-  const tokenRecebido = authorization.startsWith("Bearer ")
-    ? authorization.slice(7)
-    : "";
+  res.setHeader("Cache-Control", "no-store");
 
-  if (!syncSecret) {
-    return res.status(500).json({
+  try {
+    await verificarAdministrador(req);
+  } catch (error) {
+    return res.status(error.status || 500).json({
       success: false,
-      error: "SYNC_SECRET não configurada na Vercel.",
-    });
-  }
-
-  if (!tokenRecebido || tokenRecebido !== syncSecret) {
-    return res.status(401).json({
-      success: false,
-      error: "Não autorizado.",
+      error: error.message || "Não foi possível validar o administrador.",
     });
   }
 
