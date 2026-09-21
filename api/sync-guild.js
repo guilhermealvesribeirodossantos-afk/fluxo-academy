@@ -69,10 +69,34 @@ async function supabaseRequest(path, options = {}) {
 }
 
 export default async function handler(req, res) {
-  if (req.method !== "GET" && req.method !== "POST") {
+  // A sincronização altera dados e consome o cooldown do TitansDB.
+  // Por isso, não permitimos mais chamadas GET pelo navegador.
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+
     return res.status(405).json({
       success: false,
-      error: "Método não permitido.",
+      error: "Método não permitido. Use POST.",
+    });
+  }
+
+  const syncSecret = process.env.SYNC_SECRET;
+  const authorization = req.headers.authorization || "";
+  const tokenRecebido = authorization.startsWith("Bearer ")
+    ? authorization.slice(7)
+    : "";
+
+  if (!syncSecret) {
+    return res.status(500).json({
+      success: false,
+      error: "SYNC_SECRET não configurada na Vercel.",
+    });
+  }
+
+  if (!tokenRecebido || tokenRecebido !== syncSecret) {
+    return res.status(401).json({
+      success: false,
+      error: "Não autorizado.",
     });
   }
 
