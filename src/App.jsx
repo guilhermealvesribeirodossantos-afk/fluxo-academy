@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import {
   LayoutDashboard, Users, Trophy, CalendarDays, Settings,
-  Search, RefreshCw, Database, Wifi, WifiOff
+  Search, RefreshCw, Database, Wifi, WifiOff, LockKeyhole, LogIn, LogOut, ShieldCheck
 } from "lucide-react";
 
 const formatar = (v) => new Intl.NumberFormat("pt-BR").format(Math.round(Number(v) || 0));
@@ -353,12 +353,238 @@ function Semanas({ dados }) {
 }
 
 function Administracao({ dados, atualizar, atualizando }) {
+  const [email, setEmail] = useState("");
+  const [senha, setSenha] = useState("");
+  const [token, setToken] = useState(() => sessionStorage.getItem("fluxo_admin_token") || "");
+  const [admin, setAdmin] = useState(false);
+  const [verificando, setVerificando] = useState(Boolean(token));
+  const [entrando, setEntrando] = useState(false);
+  const [sincronizando, setSincronizando] = useState(false);
+  const [mensagem, setMensagem] = useState("");
+  const [erroAdmin, setErroAdmin] = useState("");
+
+  const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+  const publishableKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
+
+  const sair = () => {
+    sessionStorage.removeItem("fluxo_admin_token");
+    setToken("");
+    setAdmin(false);
+    setSenha("");
+    setMensagem("");
+    setErroAdmin("");
+  };
+
+  const validarAdmin = async (accessToken) => {
+    if (!accessToken) {
+      setAdmin(false);
+      setVerificando(false);
+      return false;
+    }
+
+    setVerificando(true);
+
+    try {
+      const resposta = await fetch("/api/admin-session", {
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${accessToken}`
+        },
+        cache: "no-store"
+      });
+
+      const json = await resposta.json();
+
+      if (!resposta.ok || !json.success || !json.admin) {
+        sessionStorage.removeItem("fluxo_admin_token");
+        setToken("");
+        setAdmin(false);
+        return false;
+      }
+
+      setAdmin(true);
+      return true;
+    } catch {
+      setAdmin(false);
+      return false;
+    } finally {
+      setVerificando(false);
+    }
+  };
+
+  useEffect(() => {
+    if (token) validarAdmin(token);
+    else setVerificando(false);
+  }, []);
+
+  const entrar = async (e) => {
+    e.preventDefault();
+    setErroAdmin("");
+    setMensagem("");
+
+    if (!supabaseUrl || !publishableKey) {
+      setErroAdmin("As variáveis públicas do Supabase não foram carregadas no site.");
+      return;
+    }
+
+    setEntrando(true);
+
+    try {
+      const resposta = await fetch(`${supabaseUrl}/auth/v1/token?grant_type=password`, {
+        method: "POST",
+        headers: {
+          apikey: publishableKey,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ email: email.trim(), password: senha })
+      });
+
+      const json = await resposta.json();
+
+      if (!resposta.ok || !json.access_token) {
+        throw new Error("E-mail ou senha inválidos.");
+      }
+
+      const autorizado = await validarAdmin(json.access_token);
+
+      if (!autorizado) {
+        throw new Error("Esta conta não possui permissão de administrador.");
+      }
+
+      sessionStorage.setItem("fluxo_admin_token", json.access_token);
+      setToken(json.access_token);
+      setSenha("");
+      setMensagem("Acesso administrativo liberado.");
+    } catch (e) {
+      setErroAdmin(e.message || "Não foi possível entrar.");
+    } finally {
+      setEntrando(false);
+    }
+  };
+
+  const sincronizarTitansDB = async () => {
+    if (!token || !admin || sincronizando) return;
+
+    setSincronizando(true);
+    setErroAdmin("");
+    setMensagem("");
+
+    try {
+      const resposta = await fetch("/api/sync-guild", {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${token}`
+        }
+      });
+
+      const json = await resposta.json();
+
+      if (resposta.status === 401 || resposta.status === 403) {
+        sair();
+        throw new Error("Sua sessão administrativa expirou. Entre novamente.");
+      }
+
+      if (!resposta.ok || !json.success) {
+        throw new Error(json.error || "Não foi possível sincronizar com o TitansDB.");
+      }
+
+      setMensagem(`Sincronização concluída. ${json.membersSynced || json.members || dados.members?.length || 0} membros processados.`);
+      await atualizar();
+    } catch (e) {
+      setErroAdmin(e.message || "Erro durante a sincronização.");
+    } finally {
+      setSincronizando(false);
+    }
+  };
+
+  if (verificando) {
+    return (
+      <>
+        <Cabecalho
+          eyebrow="GESTÃO DA GUILDA"
+          titulo="Administração"
+          subtitulo="Validando sua sessão administrativa."
+          semana={dados.currentWeek}
+        />
+        <section className="panel" style={{ padding: "32px" }}>
+          <div className="panel-title">
+            <ShieldCheck size={23}/>
+            <div>
+              <p className="eyebrow">SEGURANÇA</p>
+              <h2>Verificando acesso...</h2>
+              <span>Aguarde enquanto confirmamos sua conta no servidor.</span>
+            </div>
+          </div>
+        </section>
+      </>
+    );
+  }
+
+  if (!admin) {
+    return (
+      <>
+        <Cabecalho
+          eyebrow="ÁREA PROTEGIDA"
+          titulo="Administração"
+          subtitulo="Entre com a conta administrativa cadastrada no Supabase."
+          semana={dados.currentWeek}
+        />
+
+        <section className="panel" style={{ maxWidth: "620px", margin: "0 auto", padding: "32px" }}>
+          <div className="editor-head">
+            <div className="editor-icon"><LockKeyhole size={21}/></div>
+            <div>
+              <p className="eyebrow">LOGIN ADMINISTRATIVO</p>
+              <h2>Acesso restrito</h2>
+              <span>Somente a conta vinculada ao ADMIN_USER_ID pode entrar.</span>
+            </div>
+          </div>
+
+          <form onSubmit={entrar} style={{ display: "grid", gap: "16px", marginTop: "28px" }}>
+            <label style={{ display: "grid", gap: "8px" }}>
+              <span className="eyebrow">E-MAIL</span>
+              <input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                autoComplete="username"
+                required
+                placeholder="Seu e-mail administrativo"
+                style={{ width: "100%", boxSizing: "border-box", padding: "14px 16px", borderRadius: "10px" }}
+              />
+            </label>
+
+            <label style={{ display: "grid", gap: "8px" }}>
+              <span className="eyebrow">SENHA</span>
+              <input
+                type="password"
+                value={senha}
+                onChange={(e) => setSenha(e.target.value)}
+                autoComplete="current-password"
+                required
+                placeholder="Sua senha"
+                style={{ width: "100%", boxSizing: "border-box", padding: "14px 16px", borderRadius: "10px" }}
+              />
+            </label>
+
+            {erroAdmin && <div className="admin-note"><strong>ACESSO:</strong> {erroAdmin}</div>}
+
+            <button className="primary-btn" type="submit" disabled={entrando}>
+              <LogIn size={16}/>{entrando ? "Entrando..." : "Entrar na Administração"}
+            </button>
+          </form>
+        </section>
+      </>
+    );
+  }
+
   return (
     <>
       <Cabecalho
         eyebrow="GESTÃO DA GUILDA"
         titulo="Administração"
-        subtitulo="Status da integração e do banco de dados."
+        subtitulo="Área protegida para operações da guilda."
         semana={dados.currentWeek}
       />
 
@@ -384,11 +610,11 @@ function Administracao({ dados, atualizar, atualizando }) {
 
         <div className="admin-editor panel">
           <div className="editor-head">
-            <div className="editor-icon"><Database size={21}/></div>
+            <div className="editor-icon"><ShieldCheck size={21}/></div>
             <div>
-              <p className="eyebrow">INTEGRAÇÃO</p>
-              <h2>Supabase conectado</h2>
-              <span>O site não usa mais a lista manual de jogadores.</span>
+              <p className="eyebrow">ADMINISTRADOR AUTENTICADO</p>
+              <h2>Painel protegido</h2>
+              <span>Operações sensíveis são validadas novamente pelo servidor.</span>
             </div>
           </div>
 
@@ -398,24 +624,29 @@ function Administracao({ dados, atualizar, atualizando }) {
             <div><span>META SEMANAL</span><strong>{formatar(dados.guild?.weeklyGoal || 0)}</strong></div>
             <div className="calc-result">
               <span>STATUS</span>
-              <strong style={{ fontSize: "1rem" }}>CONECTADO</strong>
+              <strong style={{ fontSize: "1rem" }}>ADMIN ONLINE</strong>
             </div>
           </div>
 
           <div className="preview-row">
-            <div><span>ÚLTIMA SINCRONIZAÇÃO</span><span className="badge green"><i/>ONLINE</span></div>
+            <div><span>ÚLTIMA SINCRONIZAÇÃO</span><span className="badge green"><i/>TITANSDB</span></div>
             <p>{dataHora(dados.guild?.lastSync)}</p>
           </div>
 
-          <div className="admin-note">
-            <strong>IMPORTANTE:</strong> a edição manual foi temporariamente desativada para
-            impedir conflito com os dados reais. Depois criaremos edição persistente e protegida
-            para a administração.
-          </div>
+          {mensagem && <div className="admin-note"><strong>SUCESSO:</strong> {mensagem}</div>}
+          {erroAdmin && <div className="admin-note"><strong>ATENÇÃO:</strong> {erroAdmin}</div>}
 
-          <div className="editor-actions">
+          <div className="editor-actions" style={{ flexWrap: "wrap" }}>
+            <button className="primary-btn" onClick={sincronizarTitansDB} disabled={sincronizando}>
+              <RefreshCw size={15}/>{sincronizando ? "Sincronizando..." : "Sincronizar TitansDB"}
+            </button>
+
             <button className="secondary-btn" onClick={atualizar} disabled={atualizando}>
-              <RefreshCw size={15}/>{atualizando ? "Atualizando..." : "Recarregar dados"}
+              <Database size={15}/>{atualizando ? "Atualizando..." : "Recarregar dados"}
+            </button>
+
+            <button className="secondary-btn" onClick={sair}>
+              <LogOut size={15}/>Sair
             </button>
           </div>
         </div>
