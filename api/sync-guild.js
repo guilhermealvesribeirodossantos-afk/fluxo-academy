@@ -6,10 +6,7 @@ function separarNomeETag(nomeCompleto = "") {
   const match = nomeCompleto.match(/^(.*?)(#\d+)$/);
 
   if (!match) {
-    return {
-      nome: nomeCompleto.trim(),
-      tag: null,
-    };
+    return { nome: nomeCompleto.trim(), tag: null };
   }
 
   return {
@@ -21,15 +18,10 @@ function separarNomeETag(nomeCompleto = "") {
 function converterDataTitansDB(data) {
   if (!data) return null;
 
-  // TitansDB envia: YYYY-MM-DD HH:mm:ss
-  // Tratamos como UTC para armazenar no Supabase.
   const normalizada = data.replace(" ", "T") + "Z";
-
   const date = new Date(normalizada);
 
-  if (Number.isNaN(date.getTime())) {
-    return null;
-  }
+  if (Number.isNaN(date.getTime())) return null;
 
   return date.toISOString();
 }
@@ -106,8 +98,7 @@ export default async function handler(req, res) {
       },
     });
 
-    const contentType =
-      titansResponse.headers.get("content-type") || "";
+    const contentType = titansResponse.headers.get("content-type") || "";
 
     let titansData;
 
@@ -145,7 +136,7 @@ export default async function handler(req, res) {
     }
 
     // ========================================================
-    // 2. TRANSFORMAR MEMBROS PARA NOSSO BANCO
+    // 2. TRANSFORMAR MEMBROS
     // ========================================================
 
     const membros = guild.members.map((member) => {
@@ -155,69 +146,42 @@ export default async function handler(req, res) {
         player_uid: member.id,
         player_name: nome,
         player_tag: tag,
-
         level: Number(member.level || 0),
-
         guild_rank: member.guild?.rank || null,
-
-        current_investment: Number(
-          member.stats?.investments || 0
-        ),
-
-        networth: Number(
-          member.stats?.networth || 0
-        ),
-
-        help_count: Number(
-          member.stats?.help || 0
-        ),
-
-        bounty_count: Number(
-          member.stats?.bounty || 0
-        ),
-
-        joined_at: converterDataTitansDB(
-          member.guild?.joined
-        ),
-
-        last_online_at: converterDataTitansDB(
-          member.last_online
-        ),
-
+        current_investment: Number(member.stats?.investments || 0),
+        networth: Number(member.stats?.networth || 0),
+        help_count: Number(member.stats?.help || 0),
+        bounty_count: Number(member.stats?.bounty || 0),
+        joined_at: converterDataTitansDB(member.guild?.joined),
+        last_online_at: converterDataTitansDB(member.last_online),
         active: !member.banned,
       };
     });
 
     // ========================================================
-    // 3. SALVAR / ATUALIZAR MEMBROS NO SUPABASE
+    // 3. SALVAR / ATUALIZAR MEMBROS
     // ========================================================
 
     const membrosSalvos = await supabaseRequest(
       "members?on_conflict=player_uid",
       {
         method: "POST",
-
         headers: {
           Prefer: "resolution=merge-duplicates,return=representation",
         },
-
         body: JSON.stringify(membros),
       }
     );
 
     // ========================================================
-    // 4. MARCAR MEMBROS QUE SAÍRAM DA GUILDA COMO INATIVOS
+    // 4. MARCAR QUEM SAIU DA GUILDA COMO INATIVO
     // ========================================================
 
-    const uidsAtuais = new Set(
-      membros.map((membro) => membro.player_uid)
-    );
+    const uidsAtuais = new Set(membros.map((membro) => membro.player_uid));
 
     const membrosBanco = await supabaseRequest(
       "members?select=id,player_uid,active",
-      {
-        method: "GET",
-      }
+      { method: "GET" }
     );
 
     const membrosParaDesativar = Array.isArray(membrosBanco)
@@ -234,18 +198,102 @@ export default async function handler(req, res) {
         `members?id=eq.${encodeURIComponent(membro.id)}`,
         {
           method: "PATCH",
-          headers: {
-            Prefer: "return=minimal",
-          },
-          body: JSON.stringify({
-            active: false,
-          }),
+          headers: { Prefer: "return=minimal" },
+          body: JSON.stringify({ active: false }),
         }
       );
     }
 
     // ========================================================
-    // 5. ATUALIZAR CONFIGURAÇÕES DA GUILDA
+    // 5. LOCALIZAR A SEMANA ABERTA
+    // ========================================================
+
+    const semanasAbertas = await supabaseRequest(
+      "weeks?select=id,week_number,start_date,end_date,status&status=eq.open&order=start_date.desc&limit=1",
+      { method: "GET" }
+    );
+
+    const semanaAtual =
+      Array.isArray(semanasAbertas) && semanasAbertas.length > 0
+        ? semanasAbertas[0]
+        : null;
+
+    let snapshotsAtualizados = 0;
+    let snapshotsCriados = 0;
+
+    // ========================================================
+    // 6. ATUALIZAR PROGRESSO DA SEMANA
+    //
+    // previous_investment NUNCA é alterado aqui.
+    // Ele continua sendo a base salva no início da semana.
+    //
+    // investment recebe o valor atual do TitansDB.
+    // A coluna progress é gerada pelo PostgreSQL:
+    //
+    // investment - previous_investment
+    // ========================================================
+
+    if (semanaAtual) {
+      const membrosAtuaisBanco = await supabaseRequest(
+        "members?select=id,player_uid,level,current_investment&active=eq.true",
+        { method: "GET" }
+      );
+
+      const snapshotsExistentes = await supabaseRequest(
+        `weekly_snapshots?select=id,member_id,previous_investment,investment&week_id=eq.${semanaAtual.id}`,
+        { method: "GET" }
+      );
+
+      const snapshotPorMembro = new Map(
+        (Array.isArray(snapshotsExistentes) ? snapshotsExistentes : []).map(
+          (snapshot) => [Number(snapshot.member_id), snapshot]
+        )
+      );
+
+      for (const membro of Array.isArray(membrosAtuaisBanco) ? membrosAtuaisBanco : []) {
+        const snapshot = snapshotPorMembro.get(Number(membro.id));
+
+        if (snapshot) {
+          // Atualiza somente o valor atual e o nível.
+          // A base previous_investment fica intacta.
+          await supabaseRequest(
+            `weekly_snapshots?id=eq.${encodeURIComponent(snapshot.id)}`,
+            {
+              method: "PATCH",
+              headers: { Prefer: "return=minimal" },
+              body: JSON.stringify({
+                level: Number(membro.level || 0),
+                investment: Number(membro.current_investment || 0),
+              }),
+            }
+          );
+
+          snapshotsAtualizados += 1;
+        } else {
+          // Jogador entrou depois do início da semana.
+          // A entrada dele vira a base inicial, portanto começa em progresso 0.
+          await supabaseRequest(
+            "weekly_snapshots",
+            {
+              method: "POST",
+              headers: { Prefer: "return=minimal" },
+              body: JSON.stringify({
+                week_id: semanaAtual.id,
+                member_id: membro.id,
+                level: Number(membro.level || 0),
+                investment: Number(membro.current_investment || 0),
+                previous_investment: Number(membro.current_investment || 0),
+              }),
+            }
+          );
+
+          snapshotsCriados += 1;
+        }
+      }
+    }
+
+    // ========================================================
+    // 7. ATUALIZAR CONFIGURAÇÕES DA GUILDA
     // ========================================================
 
     const agora = new Date().toISOString();
@@ -254,11 +302,7 @@ export default async function handler(req, res) {
       "guild_settings?id=not.is.null",
       {
         method: "PATCH",
-
-        headers: {
-          Prefer: "return=minimal",
-        },
-
+        headers: { Prefer: "return=minimal" },
         body: JSON.stringify({
           guild_name: guild.name || "Fluxo Brasil",
           last_titansdb_sync: agora,
@@ -267,33 +311,29 @@ export default async function handler(req, res) {
     );
 
     // ========================================================
-    // 6. REGISTRAR HISTÓRICO DA SINCRONIZAÇÃO
+    // 8. REGISTRAR HISTÓRICO
     // ========================================================
 
     await supabaseRequest("sync_history", {
       method: "POST",
-
-      headers: {
-        Prefer: "return=minimal",
-      },
-
+      headers: { Prefer: "return=minimal" },
       body: JSON.stringify({
         source: "TitansDB",
         status: "success",
         members_received: membros.length,
-        message: `${guild.name} sincronizada com sucesso.`,
+        message: semanaAtual
+          ? `${guild.name} sincronizada. Semana #${semanaAtual.week_number}: ${snapshotsAtualizados} snapshots atualizados e ${snapshotsCriados} criados.`
+          : `${guild.name} sincronizada. Nenhuma semana aberta para atualizar progresso.`,
       }),
     });
 
     // ========================================================
-    // 7. RESPOSTA
+    // 9. RESPOSTA
     // ========================================================
 
     return res.status(200).json({
       success: true,
-
-      message: "Guilda sincronizada com sucesso.",
-
+      message: "Guilda e progresso semanal sincronizados com sucesso.",
       syncedAt: agora,
 
       guild: {
@@ -311,15 +351,22 @@ export default async function handler(req, res) {
         saved: Array.isArray(membrosSalvos)
           ? membrosSalvos.length
           : membros.length,
-
         deactivated: membrosParaDesativar.length,
       },
 
-      preview: membros.map((membro) => ({
-        name: `${membro.player_name}${
-          membro.player_tag || ""
-        }`,
+      week: semanaAtual
+        ? {
+            id: semanaAtual.id,
+            number: semanaAtual.week_number,
+            startDate: semanaAtual.start_date,
+            endDate: semanaAtual.end_date,
+            snapshotsUpdated: snapshotsAtualizados,
+            snapshotsCreated: snapshotsCriados,
+          }
+        : null,
 
+      preview: membros.map((membro) => ({
+        name: `${membro.player_name}${membro.player_tag || ""}`,
         level: membro.level,
         rank: membro.guild_rank,
         investment: membro.current_investment,
@@ -328,23 +375,17 @@ export default async function handler(req, res) {
   } catch (error) {
     console.error("Erro na sincronização:", error);
 
-    // Tenta registrar a falha sem impedir a resposta principal.
     try {
       await supabaseRequest("sync_history", {
         method: "POST",
-
-        headers: {
-          Prefer: "return=minimal",
-        },
-
+        headers: { Prefer: "return=minimal" },
         body: JSON.stringify({
           source: "TitansDB",
           status: "error",
           members_received: 0,
-          message:
-            error?.details
-              ? JSON.stringify(error.details)
-              : error?.message || "Erro desconhecido.",
+          message: error?.details
+            ? JSON.stringify(error.details)
+            : error?.message || "Erro desconhecido.",
         }),
       });
     } catch (historyError) {
@@ -354,7 +395,7 @@ export default async function handler(req, res) {
       );
     }
 
-    return res.status(500).json({
+    return res.status(error.status || 500).json({
       success: false,
       error: "Falha ao sincronizar a guilda.",
       details: error?.details || error?.message || null,
